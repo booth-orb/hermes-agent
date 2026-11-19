@@ -579,6 +579,55 @@ class TestMediaDeliveryPathValidation:
             artifact.resolve()
         )
 
+    def test_allow_dir_matches_resolved_tmp_symlink(self, tmp_path, monkeypatch):
+        private_tmp = tmp_path / "private" / "tmp"
+        private_tmp.mkdir(parents=True)
+        tmp_link = tmp_path / "tmp"
+        tmp_link.symlink_to(private_tmp, target_is_directory=True)
+        allow_dir = tmp_link / "hermes-exports"
+        allow_dir.mkdir()
+        artifact_via_link = allow_dir / "x.pdf"
+        artifact_via_link.write_bytes(b"%PDF")
+        artifact_via_real_path = private_tmp / "hermes-exports" / "x.pdf"
+        self._patch_roots(monkeypatch)
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(allow_dir))
+
+        expected = str(artifact_via_real_path.resolve())
+        assert BasePlatformAdapter.validate_media_delivery_path(str(artifact_via_link)) == expected
+        assert BasePlatformAdapter.validate_media_delivery_path(str(artifact_via_real_path)) == expected
+
+    def test_allow_dir_rejects_neighbor_outside_resolved_tmp_symlink(
+        self, tmp_path, monkeypatch,
+    ):
+        private_tmp = tmp_path / "private" / "tmp"
+        private_tmp.mkdir(parents=True)
+        tmp_link = tmp_path / "tmp"
+        tmp_link.symlink_to(private_tmp, target_is_directory=True)
+        allow_dir = tmp_link / "hermes-exports"
+        allow_dir.mkdir()
+        outside = tmp_link / "other.pdf"
+        outside.write_bytes(b"%PDF")
+        self._patch_roots(monkeypatch)
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(allow_dir))
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(outside)) is None
+
+    def test_real_allow_dir_matches_candidate_via_tmp_symlink(self, tmp_path, monkeypatch):
+        private_tmp = tmp_path / "private" / "tmp"
+        private_tmp.mkdir(parents=True)
+        tmp_link = tmp_path / "tmp"
+        tmp_link.symlink_to(private_tmp, target_is_directory=True)
+        allow_dir = private_tmp / "hermes-exports"
+        allow_dir.mkdir()
+        artifact_via_link = tmp_link / "hermes-exports" / "x.pdf"
+        artifact_via_link.write_bytes(b"%PDF")
+        self._patch_roots(monkeypatch)
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(allow_dir))
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(artifact_via_link)) == str(
+            (allow_dir / "x.pdf").resolve()
+        )
+
     @pytest.mark.parametrize("subdir", [
         ".ClAuDe", ".GeMiNi", ".CoDeX", ".SsH", ".AwS", ".CoNfIg", ".HeRmEs/logs",
         "Library/KEYCHAINS",

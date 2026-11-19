@@ -853,14 +853,33 @@ def _kanban_attachment_roots() -> list[Path]:
 
 
 def _media_delivery_allowed_roots() -> list[Path]:
-    """Return roots from which model-emitted local media may be delivered."""
+    """Return existing, resolved absolute roots for model-emitted local media delivery.
+
+    Resolve every built-in and operator root before comparison so aliases such as macOS
+    ``/tmp`` -> ``/private/tmp`` match the already-resolved candidate path. Missing or invalid
+    configured roots are ignored rather than weakening strict-mode delivery.
+    """
     from gateway.media_policy import media_delivery_allow_dirs
+
     operator_roots = (
-        root for chunk in media_delivery_allow_dirs().split(os.pathsep)
+        Path(raw_root.strip())
+        for chunk in media_delivery_allow_dirs().split(os.pathsep)
         for raw_root in chunk.split(",")
-        if (root := Path(os.path.expanduser(raw_root.strip()))).is_absolute())
-    return [*map(Path, MEDIA_DELIVERY_SAFE_ROOTS), *_profile_cache_roots(),
-            *_kanban_attachment_roots(), *operator_roots]
+        if raw_root.strip()
+    )
+    roots = [*map(Path, MEDIA_DELIVERY_SAFE_ROOTS), *_profile_cache_roots(),
+             *_kanban_attachment_roots(), *operator_roots]
+    resolved_roots: list[Path] = []
+    for root in roots:
+        try:
+            expanded = root.expanduser()
+            absolute = expanded if expanded.is_absolute() else expanded.absolute()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        resolved = _resolve_path(absolute, strict=True)
+        if resolved is not None and resolved.is_dir() and resolved not in resolved_roots:
+            resolved_roots.append(resolved)
+    return resolved_roots
 
 
 def _media_delivery_recency_seconds() -> float:
@@ -1162,9 +1181,8 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     if _path_under_denied_prefix(resolved):
         return None
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
-    for root in _media_delivery_allowed_roots():
-        resolved_root = _resolve_path(root, expand=True)
-        if resolved_root is not None and _path_is_within(resolved, resolved_root):
+    for resolved_root in _media_delivery_allowed_roots():
+        if _path_is_within(resolved, resolved_root):
             return str(resolved)
     # Non-strict (default): anything not denylisted (/etc, /proc, ~/.ssh, Hermes-root secrets).
     from gateway.media_policy import media_delivery_strict
