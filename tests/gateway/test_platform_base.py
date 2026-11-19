@@ -511,6 +511,18 @@ class TestMediaDeliveryPathValidation:
         # specifically cover recency trust re-enable it themselves.
         monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
 
+    def test_strict_mode_rejects_fresh_file_outside_allowed_roots(
+        self, tmp_path, monkeypatch,
+    ):
+        fake_home = tmp_path / "home"
+        artifact = fake_home / "Documents" / "x.pdf"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"fresh ordinary file")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        self._patch_roots(monkeypatch)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(artifact)) is None
 
     def test_rejects_symlink_escape_from_safe_root(self, tmp_path, monkeypatch):
         root = tmp_path / "media-cache"
@@ -525,6 +537,114 @@ class TestMediaDeliveryPathValidation:
         self._patch_roots(monkeypatch, root)
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(link)) is None
+
+    @pytest.mark.parametrize("rel", [
+        "credential-notes.txt",
+        "google_token.json",
+        ".env",
+        ".env.production",
+        "prod.env",
+        "google_client_secret.json",
+        "MyOAuthNotes.txt",
+        "agents/.control_token",
+        "server.pem",
+        "id_ed25519.key",
+        "auth.json",
+        "authentication.json",
+        "token_cache.json",
+    ])
+    def test_denied_filename_patterns_win_inside_allowed_root(
+        self, tmp_path, monkeypatch, rel,
+    ):
+        root = tmp_path / "allowed"
+        root.mkdir()
+        denied = root / rel
+        denied.parent.mkdir(parents=True, exist_ok=True)
+        denied.write_text("fixture")
+        self._patch_roots(monkeypatch, root)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(denied)) is None
+
+    @pytest.mark.parametrize("name", ["report.md", "chart.png", "notes.txt"])
+    def test_normal_filenames_deliver_inside_allowed_root(
+        self, tmp_path, monkeypatch, name,
+    ):
+        root = tmp_path / "allowed"
+        root.mkdir()
+        artifact = root / name
+        artifact.write_text("deliverable")
+        self._patch_roots(monkeypatch, root)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(artifact)) == str(
+            artifact.resolve()
+        )
+
+    @pytest.mark.parametrize("subdir", [
+        ".ClAuDe", ".GeMiNi", ".CoDeX", ".SsH", ".AwS", ".CoNfIg", ".HeRmEs/logs",
+        "Library/KEYCHAINS",
+    ])
+    def test_required_home_directories_denied_case_insensitively(
+        self, tmp_path, monkeypatch, subdir,
+    ):
+        fake_home = tmp_path / "home"
+        denied = fake_home / subdir / "report.md"
+        denied.parent.mkdir(parents=True)
+        denied.write_text("not deliverable")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        original_expanduser = os.path.expanduser
+        monkeypatch.setattr(
+            "gateway.platforms.base.os.path.expanduser",
+            lambda value: str(fake_home) if value == "~" else original_expanduser(value),
+        )
+        self._patch_roots(monkeypatch)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(denied)) is None
+
+    def test_hermes_carveouts_and_generated_cache_remain_deliverable(
+        self, tmp_path, monkeypatch,
+    ):
+        fake_home = tmp_path / "home"
+        hermes = fake_home / ".hermes"
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", hermes)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes)
+        roots = [hermes / "previews", hermes / "outbox", hermes / "cache" / "generated"]
+        files = []
+        for root in roots:
+            root.mkdir(parents=True)
+            artifact = root / "report.md"
+            artifact.write_text("deliverable")
+            files.append(artifact)
+        blocked = hermes / "logs" / "report.md"
+        blocked.parent.mkdir(parents=True)
+        blocked.write_text("blocked")
+        self._patch_roots(monkeypatch, *roots)
+
+        assert all(BasePlatformAdapter.validate_media_delivery_path(str(path)) == str(path.resolve())
+                   for path in files)
+        assert BasePlatformAdapter.validate_media_delivery_path(str(blocked)) is None
+
+    def test_symlink_and_dotdot_cannot_escape_to_denied_home(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        allowed = fake_home / "allowed"
+        denied = fake_home / ".gemini" / "report.md"
+        allowed.mkdir(parents=True)
+        denied.parent.mkdir(parents=True)
+        denied.write_text("blocked")
+        link = allowed / "linked.md"
+        try:
+            link.symlink_to(denied)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        self._patch_roots(monkeypatch, allowed)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(link)) is None
+        traversal = allowed / ".." / ".gemini" / "report.md"
+        assert BasePlatformAdapter.validate_media_delivery_path(str(traversal)) is None
 
     def test_filter_keeps_safe_media_and_drops_unsafe(self, tmp_path, monkeypatch):
         root = tmp_path / "media-cache"
@@ -685,11 +805,7 @@ class TestMediaDeliveryDefaultMode:
 
 
     def test_denylist_blocks_non_cache_file_under_hermes_home(self, tmp_path, monkeypatch):
-        """A non-credential file the agent wrote directly under ~/.hermes
-        (not in a cache subdir) is still deliverable via recency trust — we
-        did NOT blanket-deny the tree (per #32090/#34425). This guards against
-        accidentally re-introducing the rejected whole-tree deny.
-        """
+        """The Hermes tree is denied except for the explicit media carve-outs."""
         self._patch_roots(monkeypatch)  # strict mode on
         monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "1")
         monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_SECONDS", "600")
@@ -703,7 +819,7 @@ class TestMediaDeliveryDefaultMode:
         monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", hermes_dir)
         monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_dir)
 
-        assert BasePlatformAdapter.validate_media_delivery_path(str(artifact)) == str(artifact.resolve())
+        assert BasePlatformAdapter.validate_media_delivery_path(str(artifact)) is None
 
     def test_denylist_blocks_session_stores_but_not_neighbouring_artifacts(self, tmp_path, monkeypatch):
         """The SQLite session/kanban stores (and WAL/SHM sidecars, whose mtime is always fresh),
@@ -725,7 +841,8 @@ class TestMediaDeliveryDefaultMode:
         denied = ["state.db", "state.db-wal", "state.db-shm", "kanban.db", "kanban.db-wal",
                   "sessions/20260101_abc.json", "browser-profile/Default/Cookies",
                   "kanban/boards/team-a/kanban.db", "kanban/boards/team-a/kanban.db-wal"]
-        allowed = ["kanban/boards/team-a/attachments/report.pdf", "adhoc_report.pdf", "logs/agent.log"]
+        allowed = []
+        denied.extend(["kanban/boards/team-a/attachments/report.pdf", "adhoc_report.pdf", "logs/agent.log"])
         for rel in denied + allowed:
             path = hermes_dir / rel
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -750,7 +867,8 @@ class TestMediaDeliveryDefaultMode:
 
         denied = [".env", "auth.json", "state.db", "state.db-wal", "config.yaml",
                   "sessions/20260101_abc.json", "mcp-tokens/server.json"]
-        allowed = ["cache/images/gen.png", "report.pdf"]
+        allowed = ["cache/images/gen.png"]
+        denied.append("report.pdf")
         for rel in denied + allowed:
             path = profile_b / rel
             path.parent.mkdir(parents=True, exist_ok=True)
