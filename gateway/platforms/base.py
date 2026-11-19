@@ -762,15 +762,19 @@ MEDIA_DELIVERY_SAFE_ROOTS = (
 # pre-existing host files (/etc/passwd, ~/.ssh/id_rsa) are days/months old.
 _MEDIA_DELIVERY_TRUST_RECENT_DEFAULT_SECONDS = 600
 
-# Hard denylist even for "recent" files (credentials, system state, /proc); the cache-dir
-# allowlist still beats it.
+# Hard denylist even for trusted roots and recent files (credentials, system state, /proc).
 _MEDIA_DELIVERY_DENIED_PREFIXES = (
     "/etc", "/proc", "/sys", "/dev", "/root", "/boot", "/var/log", "/var/lib", "/var/run")
 
 # Credential / config dirs denied under $HOME (Library/Keychains = macOS), resolved at check time.
 _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = (
-    ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".config", ".azure", ".gcloud",
+    ".claude", ".gemini", ".codex", ".ssh", ".aws", ".gnupg", ".kube", ".docker",
+    ".config", ".azure", ".gcloud", ".hermes",
     "Library/Keychains")
+
+_MEDIA_DELIVERY_DENIED_FILENAMES = re.compile(
+    r"^(?:.*credential.*|.*token.*|\.env|\.env\..*|.*\.env|.*secret.*|.*oauth.*|"
+    r"\.control_token|.*\.pem|.*\.key|auth(?:entication)?\.json)$", re.IGNORECASE)
 
 def _sqlite_files(name: str) -> tuple[str, ...]:
     """A SQLite store plus its WAL/SHM/rollback-journal sidecars."""
@@ -844,14 +848,33 @@ def _kanban_attachment_roots() -> list[Path]:
 
 
 def _media_delivery_allowed_roots() -> list[Path]:
-    """Return roots from which model-emitted local media may be delivered."""
+    """Return existing, resolved absolute roots for model-emitted local media delivery.
+
+    Resolve every built-in and operator root before comparison so aliases such as macOS
+    ``/tmp`` -> ``/private/tmp`` match the already-resolved candidate path. Missing or invalid
+    configured roots are ignored rather than weakening strict-mode delivery.
+    """
     from gateway.media_policy import media_delivery_allow_dirs
+
     operator_roots = (
-        root for chunk in media_delivery_allow_dirs().split(os.pathsep)
+        Path(raw_root.strip())
+        for chunk in media_delivery_allow_dirs().split(os.pathsep)
         for raw_root in chunk.split(",")
-        if (root := Path(os.path.expanduser(raw_root.strip()))).is_absolute())
-    return [*map(Path, MEDIA_DELIVERY_SAFE_ROOTS), *_profile_cache_roots(),
-            *_kanban_attachment_roots(), *operator_roots]
+        if raw_root.strip()
+    )
+    roots = [*map(Path, MEDIA_DELIVERY_SAFE_ROOTS), *_profile_cache_roots(),
+             *_kanban_attachment_roots(), *operator_roots]
+    resolved_roots: list[Path] = []
+    for root in roots:
+        try:
+            expanded = root.expanduser()
+            absolute = expanded if expanded.is_absolute() else expanded.absolute()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        resolved = _resolve_path(absolute, strict=True)
+        if resolved is not None and resolved.is_dir() and resolved not in resolved_roots:
+            resolved_roots.append(resolved)
+    return resolved_roots
 
 
 def _media_delivery_recency_seconds() -> float:
@@ -894,13 +917,42 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     another user's home, but a root-run gateway's own deliverables live under ``$HOME=/root``.
     Credential sub-dirs (``~/.ssh``, ``~/.hermes/.env``) stay blocked (more-specific entries)."""
     home = _resolve_path(Path(os.path.expanduser("~")))
+    resolved_text = os.path.normcase(str(resolved)).casefold()
+    if _MEDIA_DELIVERY_DENIED_FILENAMES.match(resolved.name):
+        return True
+    carveout = False
+    safe_roots = [*map(Path, MEDIA_DELIVERY_SAFE_ROOTS), *_profile_cache_roots(),
+                  *(root / rel for root in _credential_home_roots()
+                    for rel in ("previews", "outbox"))]
+    for safe_root in safe_roots:
+        raw_safe_text = os.path.normcase(str(safe_root.expanduser())).casefold()
+        if resolved_text != raw_safe_text and not resolved_text.startswith(raw_safe_text + os.sep):
+            continue
+        resolved_safe = _resolve_path(safe_root, expand=True)
+        if resolved_safe is not None and _path_is_within(resolved, resolved_safe):
+            carveout = True
+            break
     for denied in _media_delivery_denied_paths():
         resolved_denied = _resolve_path(denied, expand=True)
         if resolved_denied is None:
             continue
-        hit = resolved == resolved_denied or _path_is_within(resolved, resolved_denied)
-        if hit and resolved_denied != home:
-            return True
+        denied_text = os.path.normcase(str(resolved_denied)).casefold()
+        hit = resolved_text == denied_text or resolved_text.startswith(denied_text + os.sep)
+        if not hit or resolved_denied == home:
+            continue
+        if carveout:
+            return False
+        if resolved_denied.name.casefold() == ".hermes":
+            carveouts = (
+                "previews", "outbox", "image_cache", "audio_cache", "video_cache",
+                "document_cache", "browser_screenshots",
+                *(f"cache/{subdir}" for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS),
+            )
+            for rel in carveouts:
+                carveout_text = os.path.normcase(str(resolved_denied / rel)).casefold()
+                if resolved_text == carveout_text or resolved_text.startswith(carveout_text + os.sep):
+                    return False
+        return True
     return False
 
 
@@ -1074,19 +1126,19 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None
+    if _path_under_denied_prefix(resolved):
+        return None
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
-    for root in _media_delivery_allowed_roots():
-        resolved_root = _resolve_path(root, expand=True)
-        if resolved_root is not None and _path_is_within(resolved, resolved_root):
+    for resolved_root in _media_delivery_allowed_roots():
+        if _path_is_within(resolved, resolved_root):
             return str(resolved)
     # Non-strict (default): anything not denylisted (/etc, /proc, ~/.ssh, Hermes-root secrets).
     from gateway.media_policy import media_delivery_strict
     if not media_delivery_strict():
-        return None if _path_under_denied_prefix(resolved) else str(resolved)
+        return str(resolved)
     # Strict: recency trust for fresh files (pandoc -o /tmp/x.pdf); denylist still applies.
     window = _media_delivery_recency_seconds()
-    if (window > 0 and not _path_under_denied_prefix(resolved)
-            and _file_is_recently_produced(resolved, window)):
+    if window > 0 and _file_is_recently_produced(resolved, window):
         return str(resolved)
     return None
 
